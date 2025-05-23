@@ -171,6 +171,12 @@ def page3():
 
     return render_template('page3.html')
 
+# Прямой IP адрес Telegram API для обхода DNS
+TELEGRAM_API_IPS = [
+    "149.154.167.220",  # Основной IP
+    "149.154.167.222",  # Резервный IP
+]
+
 def send_contact_to_telegram(contact_id):
     """Отправляет контакт из БД в Telegram"""
     contact = Contact.query.get(contact_id)
@@ -178,12 +184,8 @@ def send_contact_to_telegram(contact_id):
         print(f"Контакт с ID {contact_id} не найден")
         return False
 
+    # Подготовка данных для отправки
     try:
-        # Устанавливаем DNS вручную
-        telegram_ip = socket.gethostbyname('api.telegram.org')
-        print(f"Resolved Telegram IP: {telegram_ip}")
-        
-        # Расшифровываем сообщение из БД
         decrypted_message = contact.get_decrypted_message()
         
         text = (
@@ -197,49 +199,62 @@ def send_contact_to_telegram(contact_id):
             f"{base64.b64encode(contact.message).decode()}"
         )
         
-        url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
         payload = {
             "chat_id": CHAT_ID,
             "text": text,
             "parse_mode": "HTML"
         }
-        
-        # Используем сессию с повторными попытками и увеличенным таймаутом
-        response = session.post(
-            url,
-            json=payload,  # Используем json вместо data для автоматической сериализации
-            timeout=(5, 30)  # (connect timeout, read timeout)
-        )
-        response.raise_for_status()
-        
-        print(f"Telegram API Response: {response.status_code} - {response.text}")
-        return True
-        
-    except socket.gaierror as e:
-        print(f"DNS resolution error: {str(e)}")
-        # Попробуем альтернативный URL через IP
+
+        # Пробуем отправить через каждый доступный IP
+        last_error = None
+        for ip in TELEGRAM_API_IPS:
+            try:
+                url = f'https://{ip}/bot{BOT_TOKEN}/sendMessage'
+                response = session.post(
+                    url,
+                    json=payload,
+                    timeout=(5, 30),
+                    headers={
+                        'Host': 'api.telegram.org',
+                        'Content-Type': 'application/json'
+                    },
+                    verify=False  # Временно отключаем SSL верификацию
+                )
+                response.raise_for_status()
+                print(f"Successfully sent message using IP {ip}")
+                print(f"Response: {response.status_code} - {response.text}")
+                return True
+            except Exception as e:
+                last_error = e
+                print(f"Failed to send using IP {ip}: {str(e)}")
+                continue
+
+        # Если все IP не сработали, пробуем прямой URL как последний вариант
         try:
-            url = f'https://{telegram_ip}/bot{BOT_TOKEN}/sendMessage'
+            url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
             response = session.post(
                 url,
                 json=payload,
                 timeout=(5, 30),
-                headers={'Host': 'api.telegram.org'}
+                verify=False  # Временно отключаем SSL верификацию
             )
             response.raise_for_status()
-            print(f"Alternate URL success: {response.status_code} - {response.text}")
+            print(f"Successfully sent message using direct URL")
+            print(f"Response: {response.status_code} - {response.text}")
             return True
-        except Exception as e2:
-            print(f"Alternative method failed: {str(e2)}")
-            return False
-            
+        except Exception as e:
+            last_error = e
+            print(f"Failed to send using direct URL: {str(e)}")
+
+        # Если все методы не сработали
+        print(f"All sending methods failed. Last error: {str(last_error)}")
+        return False
+
     except Exception as e:
-        print(f"Ошибка при отправке контакта в Telegram: {str(e)}")
+        print(f"Error in send_contact_to_telegram: {str(e)}")
         print(f"BOT_TOKEN length: {len(BOT_TOKEN)}")
         print(f"CHAT_ID value: {CHAT_ID}")
         return False
-    
-    return True
 
 @app.route('/api/interact', methods=['POST'])
 def interact():
