@@ -7,19 +7,33 @@ import os
 import base64
 import json
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import socket
 
 app = Flask(__name__)
+
+# Настройка сессии requests с повторными попытками
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 
 # Конфигурация базы данных
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///contacts.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = 'your-secret-key'  # Required for Flask-SocketIO
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key')
 db = SQLAlchemy(app)
 socketio = SocketIO(app)
 
 # Конфигурация Telegram бота
-BOT_TOKEN = '7402155217:AAGBtXrkawByrHGZu6jJQGmWBTmx4Lysgf4'
-CHAT_ID = '1676019994'
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '7402155217:AAGBtXrkawByrHGZu6jJQGmWBTmx4Lysgf4')
+CHAT_ID = os.environ.get('CHAT_ID', '1676019994')
 
 # Генерация/загрузка ключа для шифрования
 if not os.path.exists('secret.key'):
@@ -120,7 +134,7 @@ def page3():
             errors.append("Имя должно быть c большой буквы и иметь не менее 2 символов.")
         if not email or '@' not in email or '.' not in email:
             errors.append("Неправильный формат электронной почты.")
-        if not phone or not phone.isdigit() or len(phone) > 20 :
+        if not phone or not phone.isdigit() or len(phone) > 20:
             errors.append("Номер телефона должен содержать только цифры и меньше 20 символов.")
         if not message or len(message) < 5:
             errors.append("Сообщение должно быть не менее 5 символов.")
@@ -128,24 +142,32 @@ def page3():
         if errors:
             return render_template('page3.html', errors=errors)
         else:
-            # Шифрование сообщения
-            encrypted_message = cipher_suite.encrypt(message.encode())
-            
-            # Сохранение в базу данных
-            new_contact = Contact(
-                name=name,
-                email=email,
-                phone=phone,
-                message=encrypted_message
-                # created_at добавится автоматически
-            )
-            db.session.add(new_contact)
-            db.session.commit()
+            try:
+                # Шифрование сообщения
+                encrypted_message = cipher_suite.encrypt(message.encode())
+                
+                # Сохранение в базу данных
+                new_contact = Contact(
+                    name=name,
+                    email=email,
+                    phone=phone,
+                    message=encrypted_message
+                )
+                db.session.add(new_contact)
+                db.session.commit()
 
-            # Отправка в Telegram с данными из БД
-            send_contact_to_telegram(new_contact.id)
+                # Отправка в Telegram
+                if not send_contact_to_telegram(new_contact.id):
+                    print("Ошибка отправки в Telegram")
+                    # Можно добавить сообщение об ошибке для пользователя
+                    return render_template('page3.html', 
+                                        telegram_error="Сообщение сохранено, но возникла проблема с отправкой уведомления.")
 
-            return redirect(url_for('page3'))
+                return redirect(url_for('page3'))
+            except Exception as e:
+                print(f"Ошибка при обработке формы: {str(e)}")
+                return render_template('page3.html', 
+                                    errors=["Произошла ошибка при обработке формы. Пожалуйста, попробуйте позже."])
 
     return render_template('page3.html')
 
@@ -154,20 +176,24 @@ def send_contact_to_telegram(contact_id):
     contact = Contact.query.get(contact_id)
     if not contact:
         print(f"Контакт с ID {contact_id} не найден")
-        return
+        return False
 
     try:
+        # Устанавливаем DNS вручную
+        telegram_ip = socket.gethostbyname('api.telegram.org')
+        print(f"Resolved Telegram IP: {telegram_ip}")
+        
         # Расшифровываем сообщение из БД
         decrypted_message = contact.get_decrypted_message()
         
         text = (
-            f"?? Новое сообщение из базы данных (ID: {contact.id})\n"
-            f"?? Дата: {contact.created_at}\n"
-            f"?? Имя: {contact.name}\n"
-            f"?? Телефон: {contact.phone}\n"
-            f"?? Email: {contact.email}\n"
-            f"?? Сообщение: {decrypted_message}\n\n"
-            f"?? Зашифрованное сообщение (из БД):\n"
+            f"🔔 Новое сообщение из базы данных (ID: {contact.id})\n"
+            f"📅 Дата: {contact.created_at}\n"
+            f"👤 Имя: {contact.name}\n"
+            f"📞 Телефон: {contact.phone}\n"
+            f"📧 Email: {contact.email}\n"
+            f"💬 Сообщение: {decrypted_message}\n\n"
+            f"🔐 Зашифрованное сообщение (из БД):\n"
             f"{base64.b64encode(contact.message).decode()}"
         )
         
@@ -175,14 +201,45 @@ def send_contact_to_telegram(contact_id):
         payload = {
             "chat_id": CHAT_ID,
             "text": text,
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML"
         }
-        response = requests.post(url, data=payload)
+        
+        # Используем сессию с повторными попытками и увеличенным таймаутом
+        response = session.post(
+            url,
+            json=payload,  # Используем json вместо data для автоматической сериализации
+            timeout=(5, 30)  # (connect timeout, read timeout)
+        )
         response.raise_for_status()
         
+        print(f"Telegram API Response: {response.status_code} - {response.text}")
+        return True
+        
+    except socket.gaierror as e:
+        print(f"DNS resolution error: {str(e)}")
+        # Попробуем альтернативный URL через IP
+        try:
+            url = f'https://{telegram_ip}/bot{BOT_TOKEN}/sendMessage'
+            response = session.post(
+                url,
+                json=payload,
+                timeout=(5, 30),
+                headers={'Host': 'api.telegram.org'}
+            )
+            response.raise_for_status()
+            print(f"Alternate URL success: {response.status_code} - {response.text}")
+            return True
+        except Exception as e2:
+            print(f"Alternative method failed: {str(e2)}")
+            return False
+            
     except Exception as e:
-                print(f"Ошибка при отправке контакта в Telegram: {e}")
-
+        print(f"Ошибка при отправке контакта в Telegram: {str(e)}")
+        print(f"BOT_TOKEN length: {len(BOT_TOKEN)}")
+        print(f"CHAT_ID value: {CHAT_ID}")
+        return False
+    
+    return True
 
 @app.route('/api/interact', methods=['POST'])
 def interact():
